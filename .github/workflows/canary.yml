@@ -19,24 +19,3 @@ jobs:
           else
             echo "canary: available on ref $GITHUB_REF, sha256=$(printf '%s' "$CANARY" | sha256sum | cut -c1-16)"
           fi
-# Phase A test A9 fixture: environment branch policy.
-# Created by Justin (code owner). Uses no third-party actions.
-# Prints only a SHA-256 of the harmless CANARY secret, never the value.
-name: a9-canary
-on:
-  workflow_dispatch:
-permissions: {}
-jobs:
-  canary:
-    runs-on: ubuntu-24.04
-    environment: publish-test
-    steps:
-      - name: Report whether the canary secret is available
-        env:
-          CANARY: ${{ secrets.CANARY }}
-        run: |
-          if [ -z "$CANARY" ]; then
-            echo "canary: NOT available on ref $GITHUB_REF"
-          else
-            echo "canary: available on ref $GITHUB_REF, sha256=$(printf '%s' "$CANARY" | sha256sum | cut -c1-16)"
-          fi
