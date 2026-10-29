@@ -1,0 +1,93 @@
+# Review relay v0 (Phase B). Drafted by Claude (jhilliardx-claude-ai).
+# When an agent pull request (branch claude/* or chatgpt/*) opens or updates,
+# the OTHER provider reviews the diff and posts an advisory comment review
+# as that provider's GitHub App. No third-party actions except GitHub's own
+# checkout and create-github-app-token, pinned by commit.
+name: review-relay
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+permissions:
+  contents: read
+  pull-requests: read
+concurrency:
+  group: review-relay-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  route:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft &&
+      (startsWith(github.head_ref, 'claude/') || startsWith(github.head_ref, 'chatgpt/'))
+    runs-on: ubuntu-24.04
+    outputs:
+      reviewer: ${{ steps.r.outputs.reviewer }}
+    steps:
+      - id: r
+        env:
+          HEAD: ${{ github.head_ref }}
+        run: |
+          case "$HEAD" in
+            claude/*)  echo "reviewer=openai" >> "$GITHUB_OUTPUT" ;;
+            chatgpt/*) echo "reviewer=anthropic" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  review:
+    needs: route
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: relay-${{ needs.route.outputs.reviewer }}
+    steps:
+      - name: Kill switch
+        if: vars.AGENTS_ENABLED != 'true'
+        run: |
+          echo "AGENTS_ENABLED is not 'true'; relay is off."
+          exit 1
+      - name: Check out the base branch only (rules file, relay script)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+      - name: Fetch the diff as data
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+        run: gh pr diff "$PR" -R "$GITHUB_REPOSITORY" > "$RUNNER_TEMP/pr.diff"
+      - name: Get the organization rules
+        run: curl -fsSL https://raw.githubusercontent.com/applied-unknowns/.github/main/AGENTS.md -o "$RUNNER_TEMP/AGENTS.md"
+      - name: Ask the reviewing model
+        env:
+          PROVIDER: ${{ needs.route.outputs.reviewer }}
+          MODEL: ${{ needs.route.outputs.reviewer == 'openai' && (vars.OPENAI_REVIEW_MODEL || 'gpt-6.1-sol') || (vars.ANTHROPIC_REVIEW_MODEL || 'claude-opus-5-5') }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          DIFF_FILE: ${{ runner.temp }}/pr.diff
+          AGENTS_FILE: ${{ runner.temp }}/AGENTS.md
+          OUT_FILE: ${{ runner.temp }}/review.md
+        run: python3 .github/relay/review.py
+      - name: Kill switch (before writing)
+        if: vars.AGENTS_ENABLED != 'true'
+        run: exit 1
+      - name: Mint the reviewer App token (current repository only, revoked at job end)
+        id: app
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ needs.route.outputs.reviewer == 'openai' && '5505016' || '5504992' }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          permission-pull-requests: write
+          permission-contents: read
+      - name: Post the advisory review (COMMENT only)
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          body = pathlib.Path(os.environ["RUNNER_TEMP"], "review.md").read_text()
+          pathlib.Path(os.environ["RUNNER_TEMP"], "payload.json").write_text(
+              json.dumps({"event": "COMMENT", "commit_id": os.environ["HEAD_SHA"], "body": body}))
+          PY
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/$PR/reviews" --input "$RUNNER_TEMP/payload.json" --jq '.html_url'
